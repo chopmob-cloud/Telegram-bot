@@ -1,0 +1,842 @@
+// =========================
+// In-memory state
+// =========================
+
+// Anti-raid
+let recentJoins = [];
+let raidActive = false;
+let raidEndsAt = 0;
+let raidAlertCooldownUntil = 0;
+
+// Flood control: messages per user per window
+let floodMap = {}; // key: `${chatId}:${userId}` -> { count, windowStart }
+
+// Track users we've seen send a message in each chat
+let seenUsers = {}; // key: `${chatId}:${userId}` -> true
+
+// =========================
+// Away Mode (GLOBAL STATE)
+// =========================
+let AWAY_MODE = {};
+
+// =========================
+// Bad Words (KV-backed cache)
+// =========================
+let BAD_WORD_PATTERNS = null;
+
+// =========================
+// Mods / Warnings (ADDED)
+// =========================
+
+// key: chatId -> Set of userIds
+let MODS = {};
+
+// key: `${chatId}:${userId}` -> count
+let WARNINGS = {};
+
+function isMod(chatId, userId) {
+  return MODS[chatId]?.has(userId) || false;
+}
+function addMod(chatId, userId) {
+  if (!MODS[chatId]) MODS[chatId] = new Set();
+  MODS[chatId].add(userId);
+}
+function removeMod(chatId, userId) {
+  MODS[chatId]?.delete(userId);
+}
+
+// =========================
+// Project Knowledge
+// =========================
+
+const PROJECT_KNOWLEDGE = `
+PROJECT:
+NETWORK: 
+TOKEN NAME: 
+TOTAL SUPPLY: 
+CIRCULATING SUPPLY: 
+WEBSITE: 
+
+MISSION:
+
+TOKENOMICS:
+
+LIQUIDITY MODEL:
+
+
+VALUES:
+
+`;
+
+// =========================
+// Moderation Config
+// =========================
+
+const FLOOD_WINDOW_MS = 10_000; // 10 seconds
+const FLOOD_MAX_MESSAGES = 7;   // max messages per window
+
+const SCAM_WORDS = [
+  "seed phrase","double your money","airdrop bot","free eth",
+  "giveaway","claim reward","private key","metamask support",
+  "wallet unlock","support agent","support team", "pump", "raid",
+];
+
+const SAFE_DOMAINS = [
+  "",
+  "",
+  "",
+  "",
+  ""
+];
+
+function containsUnsafeLink(text) {
+  const urlRegex = /https?:\/\/[^\s]+/gi;
+  const matches = text.match(urlRegex);
+  if (!matches) return false;
+
+  for (const url of matches) {
+    const lower = url.toLowerCase();
+    const isSafe = SAFE_DOMAINS.some(domain => lower.includes(domain));
+    if (!isSafe) return true;
+  }
+  return false;
+}
+
+// =========================
+// Unicode / Normalization Helpers
+// =========================
+
+// Map of common homoglyphs → ASCII
+const HOMOGLYPH_MAP = {
+  // Cyrillic
+  "А": "A", "В": "B", "Е": "E", "К": "K", "М": "M", "Н": "N", "О": "O", "Р": "P",
+  "С": "S", "Т": "T", "Х": "X", "У": "Y",
+  "а": "a", "е": "e", "к": "k", "м": "m", "н": "n", "о": "o", "р": "p",
+  "с": "s", "т": "t", "х": "x", "у": "y",
+
+  // Greek
+  "Α": "A", "Β": "B", "Ε": "E", "Ζ": "Z", "Η": "H", "Ι": "I", "Κ": "K",
+  "Μ": "M", "Ν": "N", "Ο": "O", "Ρ": "P", "Τ": "T", "Υ": "Y", "Χ": "X",
+  "α": "a", "β": "b", "ε": "e", "ζ": "z", "η": "h", "ι": "i", "κ": "k",
+  "μ": "m", "ν": "n", "ο": "o", "ρ": "p", "τ": "t", "υ": "y", "χ": "x",
+
+  // Turkish dotless i etc.
+  "ı": "i", "İ": "I",
+
+  // Misc fancy letters often used to bypass filters (add more if needed)
+  "ᴀ": "a","ʙ": "b","ᴄ": "c","ᴅ": "d","ᴇ": "e","ꜰ": "f","ɢ": "g",
+  "ʜ": "h","ɪ": "i","ᴊ": "j","ᴋ": "k","ʟ": "l","ᴍ": "m","ɴ": "n",
+  "ᴏ": "o","ᴘ": "p","ǫ": "q","ʀ": "r","s": "s","ᴛ": "t","ᴜ": "u",
+  "ᴠ": "v","ᴡ": "w","x": "x","ʏ": "y","ᴢ": "z"
+};
+
+function normalizeText(str) {
+  if (!str) return "";
+
+  // 1) Compatibility normalization (full-width, etc.)
+  let s = str.normalize("NFKC");
+
+  // 2) Decompose then strip diacritics (é → e, ñ → n, etc.)
+  s = s.normalize("NFD").replace(/[\u0300-\u036f]/g, "");
+
+  // 3) Remove zero-width and directionality control chars
+  s = s
+    .replace(/[\u200B-\u200F]/g, "")   // zero-width spaces & similar
+    .replace(/[\u202A-\u202E]/g, "")   // directional formatting
+    .replace(/[\u2060-\u2064]/g, "")   // word joiners etc.
+    .replace(/\uFEFF/g, "");           // BOM / zero-width no-break
+
+  // 4) Map homoglyphs to ASCII lookalikes
+  s = s.split("").map(ch => HOMOGLYPH_MAP[ch] || ch).join("");
+
+  // 5) Normalize whitespace (including weird spaces) to single spaces
+  s = s.replace(/\s+/g, " ").trim();
+
+  return s;
+}
+
+// =========================
+// Load bad words from KV
+// =========================
+async function loadBadWords(env) {
+  if (BAD_WORD_PATTERNS) return;
+
+  const raw = await env.BADLIST_KV.get("BAD_WORDS");
+  if (!raw) {
+    BAD_WORD_PATTERNS = [];
+    return;
+  }
+
+  const list = JSON.parse(raw);
+
+  BAD_WORD_PATTERNS = list.map(word => {
+    const escaped = word.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    return new RegExp(`\\b${escaped}\\b`, "i");
+  });
+}
+
+// =========================
+// Worker Handler
+// =========================
+
+export default {
+  async fetch(request, env, ctx) {
+    if (request.method !== "POST") {
+      return new Response("OK", { status: 200 });
+    }
+
+    let update;
+    try {
+      update = await request.json();
+    } catch {
+      return new Response("Bad Request", { status: 400 });
+    }
+
+    const now = Date.now();
+    const api = `https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}`;
+	await loadBadWords(env);
+
+    async function call(method, params) {
+      const res = await fetch(`${api}/${method}`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(params)
+      });
+      return res.json().catch(() => ({}));
+    }
+
+    // ============= Admin / Mod helpers (ADDED) =============
+    async function isAdmin(chatId, userId) {
+      const res = await call("getChatMember", { chat_id: chatId, user_id: userId });
+      return ["administrator", "creator"].includes(res?.result?.status);
+    }
+
+    async function canModerate(chatId, actorId, targetId) {
+      const actorIsAdmin = await isAdmin(chatId, actorId);
+      const actorIsMod = isMod(chatId, actorId);
+      if (!actorIsAdmin && !actorIsMod) return false;
+
+      const target = await call("getChatMember", { chat_id: chatId, user_id: targetId });
+      return !["administrator", "creator"].includes(target?.result?.status);
+    }
+
+    // ========= RAID COOL DOWN =========
+    if (raidActive && now > raidEndsAt) {
+      raidActive = false;
+      recentJoins = [];
+      raidAlertCooldownUntil = 0;
+    }
+
+    const message = update.message || update.edited_message;
+    if (!message) return new Response("ignored");
+
+    // =========================
+    // 1) Anti-Raid & Welcome
+    // =========================
+    if (message.new_chat_members?.length > 0) {
+      const chatId = message.chat.id;
+
+      // prune join timestamps older than 30 seconds
+      recentJoins = recentJoins.filter(ts => now - ts < 30_000);
+      recentJoins.push(now);
+
+      const RAID_THRESHOLD = 5;
+      const RAID_DURATION_MS = 120_000;
+
+      if (!raidActive && recentJoins.length >= RAID_THRESHOLD) {
+        raidActive = true;
+        raidEndsAt = now + RAID_DURATION_MS;
+
+        if (now > raidAlertCooldownUntil) {
+          raidAlertCooldownUntil = now + 60_000;
+          await call("sendMessage", {
+            chat_id: chatId,
+            text:
+`🚨 *Raid Protection Activated!*  
+Unusual join activity detected. New-looking accounts may be auto-kicked temporarily.`,
+            parse_mode: "Markdown"
+          });
+        }
+      }
+
+      for (const user of message.new_chat_members) {
+        if (user.is_bot) continue;
+
+        const looksNew = !user.username && !user.is_premium;
+        if (raidActive && looksNew) {
+          await call("banChatMember", {
+            chat_id: chatId,
+            user_id: user.id,
+            until_date: Math.floor((now + 300_000) / 1000) // 5 min temp ban
+          });
+          await call("sendMessage", {
+            chat_id: chatId,
+            text: "🛡️ Anti-raid: auto-kicked a new-looking account."
+          });
+          continue;
+        }
+
+        await call("sendMessage", {
+          chat_id: chatId,
+          text:
+`Welcome to ? 🟡  
+Join the mission, spread the meme, secure the bag 💰  
+
+Official links → /links  
+About the project → /about`
+        });
+      }
+
+      return new Response("welcomed");
+    }
+
+    // =========================
+    // 2) Basic Validation
+    // =========================
+    if (!message.text) return new Response("ignored");
+
+    const chatId = message.chat.id;
+    const userId = message.from.id;
+    const originalText = message.text;
+    const text = originalText.toLowerCase(); // raw lowercase (used for some things)
+    const normalizedText = normalizeText(originalText);
+    const normalizedLower = normalizedText.toLowerCase();
+    const userKey = `${chatId}:${userId}`;
+
+    // =========================
+    // 3) Commands (/rules /links /about /faq /tokenomics /ai) + MOD COMMANDS (ADDED)
+    // =========================
+
+    // ---------- MOD MANAGEMENT (ADDED) ----------
+    if (text.startsWith("/addmod")) {
+      if (!(await isAdmin(chatId, userId))) {
+        await call("sendMessage", { chat_id: chatId, text: "❌ Admins only." });
+        return new Response("no_permission");
+      }
+      const target = message.reply_to_message?.from;
+      if (!target) {
+        await call("sendMessage", { chat_id: chatId, text: "Reply to a user with /addmod" });
+        return new Response("no_target");
+      }
+      addMod(chatId, target.id);
+      await call("sendMessage", {
+        chat_id: chatId,
+        text: `🛡️ ${target.username ? "@" + target.username : target.first_name} is now a moderator.`
+      });
+      return new Response("mod_added");
+    }
+
+    if (text.startsWith("/removemod")) {
+      if (!(await isAdmin(chatId, userId))) {
+        await call("sendMessage", { chat_id: chatId, text: "❌ Admins only." });
+        return new Response("no_permission");
+      }
+      const target = message.reply_to_message?.from;
+      if (!target) {
+        await call("sendMessage", { chat_id: chatId, text: "Reply to a user with /removemod" });
+        return new Response("no_target");
+      }
+      removeMod(chatId, target.id);
+      await call("sendMessage", {
+        chat_id: chatId,
+        text: `❌ ${target.username ? "@" + target.username : target.first_name} is no longer a moderator.`
+      });
+      return new Response("mod_removed");
+    }
+
+    if (text.startsWith("/mods")) {
+      const ids = [...(MODS[chatId] || [])];
+      if (!ids.length) {
+        await call("sendMessage", { chat_id: chatId, text: "No moderators set." });
+        return new Response("mods_empty");
+      }
+
+      const lines = [];
+      for (const id of ids) {
+        const res = await call("getChatMember", { chat_id: chatId, user_id: id });
+        const u = res?.result?.user;
+        if (u) lines.push(`• ${u.username ? "@" + u.username : u.first_name}`);
+      }
+
+      await call("sendMessage", {
+        chat_id: chatId,
+        text: `🛡️ *Moderators*\n\n${lines.join("\n")}`,
+        parse_mode: "Markdown"
+      });
+      return new Response("mods_list");
+    }
+
+    if (text.startsWith("/ismod")) {
+      const target = message.reply_to_message?.from;
+      if (!target) {
+        await call("sendMessage", { chat_id: chatId, text: "Reply to a user with /ismod" });
+        return new Response("no_target");
+      }
+      await call("sendMessage", {
+        chat_id: chatId,
+        text: isMod(chatId, target.id) ? "✅ User is a moderator." : "❌ User is not a moderator."
+      });
+      return new Response("ismod");
+    }
+
+    // ---------- MOD-ONLY COMMANDS (ADDED) ----------
+    if (text.startsWith("/mute")) {
+      const target = message.reply_to_message?.from;
+      if (!target) {
+        await call("sendMessage", { chat_id: chatId, text: "Reply to a user with /mute [minutes]" });
+        return new Response("no_target");
+      }
+      if (!(await canModerate(chatId, userId, target.id))) {
+        await call("sendMessage", { chat_id: chatId, text: "❌ You cannot mute this user." });
+        return new Response("no_permission");
+      }
+
+      const mins = parseInt(text.split(" ")[1] || "10", 10);
+      const until = Math.floor((now + mins * 60_000) / 1000);
+
+      await call("restrictChatMember", {
+        chat_id: chatId,
+        user_id: target.id,
+        permissions: { can_send_messages: false },
+        until_date: until
+      });
+
+      await call("sendMessage", { chat_id: chatId, text: `🔇 User muted for ${mins} minutes.` });
+      return new Response("muted");
+    }
+
+    if (text.startsWith("/unmute")) {
+      const target = message.reply_to_message?.from;
+      if (!target) {
+        await call("sendMessage", { chat_id: chatId, text: "Reply to a user with /unmute" });
+        return new Response("no_target");
+      }
+      if (!(await canModerate(chatId, userId, target.id))) {
+        await call("sendMessage", { chat_id: chatId, text: "❌ You cannot unmute this user." });
+        return new Response("no_permission");
+      }
+
+      await call("restrictChatMember", {
+        chat_id: chatId,
+        user_id: target.id,
+        permissions: {
+          can_send_messages: true,
+          can_send_media_messages: true,
+          can_send_other_messages: true,
+          can_add_web_page_previews: true
+        }
+      });
+
+      await call("sendMessage", { chat_id: chatId, text: "🔊 User unmuted." });
+      return new Response("unmuted");
+    }
+
+    if (text.startsWith("/warn")) {
+      const target = message.reply_to_message?.from;
+      if (!target) {
+        await call("sendMessage", { chat_id: chatId, text: "Reply to a user with /warn" });
+        return new Response("no_target");
+      }
+      if (!(await canModerate(chatId, userId, target.id))) {
+        await call("sendMessage", { chat_id: chatId, text: "❌ You cannot warn this user." });
+        return new Response("no_permission");
+      }
+
+      const key = `${chatId}:${target.id}`;
+      WARNINGS[key] = (WARNINGS[key] || 0) + 1;
+
+      await call("sendMessage", { chat_id: chatId, text: `⚠️ Warning issued (${WARNINGS[key]}/3).` });
+
+      if (WARNINGS[key] >= 3) {
+        WARNINGS[key] = 0;
+        await call("restrictChatMember", {
+          chat_id: chatId,
+          user_id: target.id,
+          permissions: { can_send_messages: false },
+          until_date: Math.floor((now + 15 * 60_000) / 1000)
+        });
+        await call("sendMessage", { chat_id: chatId, text: "🔇 Auto-muted for 15 minutes (3 warnings)." });
+      }
+
+      return new Response("warned");
+    }
+
+    if (text.startsWith("/kick")) {
+      const target = message.reply_to_message?.from;
+      if (!target) {
+        await call("sendMessage", { chat_id: chatId, text: "Reply to a user with /kick" });
+        return new Response("no_target");
+      }
+      if (!(await canModerate(chatId, userId, target.id))) {
+        await call("sendMessage", { chat_id: chatId, text: "❌ You cannot kick this user." });
+        return new Response("no_permission");
+      }
+
+      await call("banChatMember", {
+        chat_id: chatId,
+        user_id: target.id,
+        until_date: Math.floor(now / 1000) + 60
+      });
+      await call("unbanChatMember", { chat_id: chatId, user_id: target.id });
+
+      await call("sendMessage", { chat_id: chatId, text: "👢 User kicked." });
+      return new Response("kicked");
+    }
+
+    if (text.startsWith("/ban")) {
+      const target = message.reply_to_message?.from;
+      if (!target) {
+        await call("sendMessage", { chat_id: chatId, text: "Reply to a user with /ban" });
+        return new Response("no_target");
+      }
+      if (!(await canModerate(chatId, userId, target.id))) {
+        await call("sendMessage", { chat_id: chatId, text: "❌ You cannot ban this user." });
+        return new Response("no_permission");
+      }
+
+      await call("banChatMember", { chat_id: chatId, user_id: target.id });
+      await call("sendMessage", { chat_id: chatId, text: "🔨 User banned." });
+      return new Response("banned");
+    }
+
+    if (text.startsWith("/purge")) {
+      // allow mods OR admins
+      if (!(isMod(chatId, userId) || (await isAdmin(chatId, userId)))) {
+        await call("sendMessage", { chat_id: chatId, text: "❌ Mods only." });
+        return new Response("no_permission");
+      }
+
+      const count = Math.min(parseInt(text.split(" ")[1] || "5", 10), 50);
+      for (let i = 0; i < count; i++) {
+        await call("deleteMessage", {
+          chat_id: chatId,
+          message_id: message.message_id - i
+        });
+      }
+      return new Response("purged");
+    }
+
+// ---------- AWAY MODE ----------
+if (text.startsWith("/away")) {
+  if (!(isMod(chatId, userId) || (await isAdmin(chatId, userId)))) {
+    await call("sendMessage", { chat_id: chatId, text: "❌ Mods only." });
+    return new Response("no_permission");
+  }
+
+  AWAY_MODE[chatId] ??= {
+    enabled: false,
+    message: "⏰ All admins are currently away. \n \nPlease use / commands to gain information or support.",
+    pinnedMessageId: null,
+    lastReplyMap: {}
+  };
+
+  const parts = originalText.split(" ");
+  const action = (parts[1] || "").toLowerCase();
+  const customMessage = parts.slice(2).join(" ").trim();
+
+  if (action === "on") {
+    AWAY_MODE[chatId].enabled = true;
+    if (customMessage) AWAY_MODE[chatId].message = customMessage;
+
+    const sent = await call("sendMessage", {
+      chat_id: chatId,
+      text: `🚫 *Away Mode Enabled*\n\n${AWAY_MODE[chatId].message}`,
+      parse_mode: "Markdown"
+    });
+
+    if (sent?.result?.message_id) {
+      await call("pinChatMessage", {
+        chat_id: chatId,
+        message_id: sent.result.message_id,
+        disable_notification: true
+      });
+      AWAY_MODE[chatId].pinnedMessageId = sent.result.message_id;
+    }
+
+    return new Response("away_on");
+  }
+
+  if (action === "off") {
+    AWAY_MODE[chatId].enabled = false;
+    AWAY_MODE[chatId].lastReplyMap = {};
+
+    if (AWAY_MODE[chatId].pinnedMessageId) {
+      await call("unpinChatMessage", {
+        chat_id: chatId,
+        message_id: AWAY_MODE[chatId].pinnedMessageId
+      });
+      AWAY_MODE[chatId].pinnedMessageId = null;
+    }
+
+    await call("sendMessage", {
+      chat_id: chatId,
+      text: "✅ Away mode disabled."
+    });
+
+    return new Response("away_off");
+  }
+
+  await call("sendMessage", {
+    chat_id: chatId,
+    text: AWAY_MODE[chatId].enabled
+      ? `⏰ *Away Mode is ON*\n\n${AWAY_MODE[chatId].message}`
+      : "✅ *Away Mode is OFF*",
+    parse_mode: "Markdown"
+  });
+
+  return new Response("away_status");
+}
+
+    // ---------- ORIGINAL COMMANDS ----------
+    if (text.startsWith("/rules")) {
+      await call("sendMessage", {
+        chat_id: chatId,
+        text:
+`📜 *Rules* 🟡
+
+1. No spam  
+2. No scam links or fake airdrops  
+3. No seed phrases / private keys  
+4. Respect others  
+5. Your bot has the final say`,
+        parse_mode: "Markdown"
+      });
+      return new Response("rules");
+    }
+
+    if (text.startsWith("/links")) {
+      await call("sendMessage", {
+        chat_id: chatId,
+        text:
+`🔗 *Links* 🟡
+
+🌐 Website:  
+🐦 X (Twitter): 
+📣 Reddit:  
+📊 Chart:  
+
+Always verify links — beware of fakes.`,
+        parse_mode: "Markdown"
+      });
+      return new Response("links");
+    }
+
+    if (text.startsWith("/about")) {
+      await call("sendMessage", {
+        chat_id: chatId,
+        text:
+`ℹ️ *About* 🟡
+
+Text here
+
+Run /faq or /tokenomics for more info.`,
+        parse_mode: "Markdown"
+      });
+      return new Response("about");
+    }
+
+    if (text.startsWith("/faq")) {
+      await call("sendMessage", {
+        chat_id: chatId,
+        text:
+`❓ *FAQ* 🟡
+
+• What is ? 
+Text Here
+
+• Is liquidity locked?  
+Text Here
+
+• What is the mission?  
+Text Here
+
+• Is there utility?  
+Roadmap includes tools, gamification, dApps.
+
+See /tokenomics for more details.`,
+        parse_mode: "Markdown"
+      });
+      return new Response("faq");
+    }
+
+    if (text.startsWith("/tokenomics")) {
+      await call("sendMessage", {
+        chat_id: chatId,
+        text:
+`💰 *Tokenomics* 🟡
+
+Text Here  
+
+Breakdown:
+
+
+Liquidity:
+• Text Here  
+• Text Here`,
+        parse_mode: "Markdown"
+      });
+      return new Response("tokenomics");
+    }
+
+    // AI command
+    if (text.startsWith("/ai")) {
+      const question = originalText.replace(/\/ai\s*/i, "").trim();
+      if (!question) {
+        await call("sendMessage", {
+          chat_id: chatId,
+          text:
+"Ask me something like:\n/ai What is your idea?\n/ai How does tokenomics work?"
+        });
+        return new Response("ai_no_question");
+      }
+
+      let aiAnswer = "AI error — try again shortly.";
+      try {
+        const prompt = `
+You are the official AI assistant.
+
+Project info:
+${PROJECT_KNOWLEDGE}
+
+User question: "${question}"
+
+Answer briefly. No financial advice.
+`;
+        const result = await env.AI.run("@cf/meta/llama-3.1-8b-instruct", { prompt });
+        aiAnswer = result.response || result.output || result.text || JSON.stringify(result);
+      } catch (e) {
+        aiAnswer = "AI temporarily unavailable. Try again soon.";
+      }
+
+      await call("sendMessage", { chat_id: chatId, text: aiAnswer });
+      return new Response("ai");
+    }
+
+    // =========================
+    // 4) Moderation
+    // =========================
+    // IMPORTANT: per your choice, MODS ARE STILL FILTERED (no bypass)
+
+    // -- Flood control --
+    {
+      const entry = floodMap[userKey] || { count: 0, windowStart: now };
+      if (now - entry.windowStart > FLOOD_WINDOW_MS) {
+        entry.count = 0;
+        entry.windowStart = now;
+      }
+      entry.count++;
+      floodMap[userKey] = entry;
+
+      if (entry.count > FLOOD_MAX_MESSAGES) {
+        await call("deleteMessage", { chat_id: chatId, message_id: message.message_id });
+        await call("sendMessage", {
+          chat_id: chatId,
+          text: "🚫 Slow down, you're sending messages too quickly."
+        });
+        return new Response("flood_blocked");
+      }
+    }
+
+// ---------- AWAY MODE AUTO-REPLY ----------
+if (AWAY_MODE[chatId]?.enabled) {
+  if (
+    !message.from.is_bot &&
+    !isMod(chatId, userId) &&
+    !(await isAdmin(chatId, userId))
+  ) {
+    AWAY_MODE[chatId].lastReplyMap ??= {};
+    const last = AWAY_MODE[chatId].lastReplyMap[userId] || 0;
+
+    if (now - last > 10 * 60_000) {
+      if (
+        normalizedLower.includes("admin") ||
+        normalizedLower.includes("help") ||
+        normalizedLower.includes("support") ||
+        normalizedLower.includes("@")
+      ) {
+        await call("sendMessage", {
+          chat_id: chatId,
+          text: AWAY_MODE[chatId].message
+        });
+        AWAY_MODE[chatId].lastReplyMap[userId] = now;
+      }
+    }
+  }
+}
+
+
+    // -- First message link protection --
+    {
+      const hasSeen = seenUsers[userKey];
+      const linkPresent = /https?:\/\/[^\s]+/gi.test(text);
+
+      if (!hasSeen && linkPresent) {
+        seenUsers[userKey] = true;
+        await call("deleteMessage", { chat_id: chatId, message_id: message.message_id });
+        await call("sendMessage", {
+          chat_id: chatId,
+          text: "⚠️ Your first message cannot contain links. Try again without links."
+        });
+        return new Response("first_link_blocked");
+      }
+
+      seenUsers[userKey] = true;
+    }
+
+    // -- Smart profanity filter (using normalized text + precompiled patterns) --
+    {
+      const cleaned = normalizedLower;
+      const hit = BAD_WORD_PATTERNS.some(regex => regex.test(cleaned));
+
+      if (hit) {
+        await call("deleteMessage", { chat_id: chatId, message_id: message.message_id });
+        await call("sendMessage", {
+          chat_id: chatId,
+          text: "⚠️ Message removed due to inappropriate language."
+        });
+        return new Response("bad_word_blocked");
+      }
+    }
+
+    // -- Caps lock spam --
+    {
+      const letters = normalizedText.replace(/[^a-zA-Z]/g, "");
+      if (letters.length >= 12) {
+        const caps = (letters.match(/[A-Z]/g) || []).length;
+        if (caps / letters.length > 0.75) {
+          await call("deleteMessage", { chat_id: chatId, message_id: message.message_id });
+          await call("sendMessage", {
+            chat_id: chatId,
+            text: "🔇 Please avoid excessive caps, it looks like shouting."
+          });
+          return new Response("caps_blocked");
+        }
+      }
+    }
+
+    // -- Scam phrase + unsafe link detection --
+    {
+      const scamHit = SCAM_WORDS.some(w => normalizedLower.includes(w));
+      const unsafeLink = containsUnsafeLink(originalText);
+
+      if (scamHit || unsafeLink) {
+        await call("deleteMessage", { chat_id: chatId, message_id: message.message_id });
+
+        const username = message.from.username
+          ? `@${message.from.username}`
+          : (message.from.first_name || "user");
+
+        await call("sendMessage", {
+          chat_id: chatId,
+          text:
+`⚠️ Possible scam/spam message removed.
+Please avoid suspicious links or phrases, ${username}.`
+        });
+
+        return new Response("scam_blocked");
+      }
+    }
+
+    return new Response("ignored");
+  }
+};
